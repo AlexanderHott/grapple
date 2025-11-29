@@ -11,6 +11,7 @@ use log::*;
 use std::collections::HashSet;
 use std::ffi::CStr;
 use std::os::raw::c_void;
+use thiserror::Error;
 use vulkanalia::Version;
 use vulkanalia::loader::{LIBRARY, LibloadingLoader};
 use vulkanalia::prelude::v1_0::*;
@@ -80,6 +81,7 @@ impl App {
         let entry = Entry::new(loader).map_err(|b| anyhow!("{}", b))?;
         let mut data = AppData::default();
         let instance = create_instance(window, &entry, &mut data)?;
+        pick_physical_device(&instance, &mut data)?;
         return Ok(Self {
             entry,
             instance,
@@ -102,10 +104,92 @@ impl App {
     }
 }
 
+
+unsafe fn pick_physical_device(instance: &Instance, data: &mut AppData) -> Result<()> {
+    for physical_device in instance.enumerate_physical_devices()? {
+        let properties = instance.get_physical_device_properties(physical_device);
+
+        if let Err(error) = check_physical_device(instance, data, physical_device) {
+            warn!(
+                "Skipping physical device (`{}`): {}",
+                properties.device_name, error
+            );
+        } else {
+            info!("Selected physical device: (`{}`)", properties.device_name);
+            data.physical_device = physical_device;
+            return Ok(());
+        }
+    }
+
+    return Err(anyhow!("Failed to find a suitable physical device."));
+}
+
+#[derive(Debug, Error)]
+#[error("Missing {0}.")]
+pub struct SuitabilityError(pub &'static str);
+
+unsafe fn check_physical_device(
+    instance: &Instance,
+    data: &mut AppData,
+    physical_device: vk::PhysicalDevice,
+) -> Result<()> {
+    // let properties = instance.get_physical_device_properties(physical_device);
+    //
+    // // FIXME: example check, not actually required
+    // if properties.device_type != vk::PhysicalDeviceType::DISCRETE_GPU {
+    //     return Err(anyhow!(SuitabilityError(
+    //         "Only discrete GPUs are supported."
+    //     )));
+    // }
+    //
+    // let features = instance.get_physical_device_features(physical_device);
+    //
+    // // FIXME: example check, not actually required
+    // if features.geometry_shader != vk::TRUE {
+    //     return Err(anyhow!(SuitabilityError(
+    //         "Missing geometry shader support."
+    //     )));
+    // }
+
+    let _ = QueueFamilyIndices::get(instance, data, physical_device)?;
+
+    return Ok(());
+}
+
+#[derive(Copy, Clone, Debug)]
+struct QueueFamilyIndices {
+    graphics: u32,
+}
+
+impl QueueFamilyIndices {
+    unsafe fn get(
+        instance: &Instance,
+        data: &mut AppData,
+        physical_device: vk::PhysicalDevice,
+    ) -> Result<Self> {
+        let properties = instance.get_physical_device_queue_family_properties(physical_device);
+
+        let graphics = properties
+            .iter()
+            .position(|p| p.queue_flags.contains(vk::QueueFlags::GRAPHICS))
+            // FIXME: should be: .map(u32::try_from);
+            .map(|i| i as u32);
+
+        return if let Some(graphics) = graphics {
+            Ok(Self { graphics })
+        } else {
+            Err(anyhow!(SuitabilityError(
+                "Missing required queue families."
+            )))
+        };
+    }
+}
+
 /// The Vulkan handles and associated properties used by our Vulkan app.
 #[derive(Debug, Clone, Default)]
 struct AppData {
     messenger: vk::DebugUtilsMessengerEXT,
+    physical_device: vk::PhysicalDevice,
 }
 
 unsafe fn create_instance(window: &Window, entry: &Entry, data: &mut AppData) -> Result<Instance> {
@@ -151,7 +235,7 @@ unsafe fn create_instance(window: &Window, entry: &Entry, data: &mut AppData) ->
     };
 
     if VALIDATION_ENABLED {
-        extensions.push(vk::EXT_DEBUG_UTILS_EXTENSION.name.as_ptr())
+        extensions.push(vk::EXT_DEBUG_UTILS_EXTENSION.name.as_ptr());
     }
 
     let mut info = vk::InstanceCreateInfo::builder()
