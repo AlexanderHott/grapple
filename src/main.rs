@@ -90,6 +90,10 @@ impl App {
         data.surface = vk_window::create_surface(&instance, &window, &window)?;
         pick_physical_device(&instance, &mut data)?;
         let device = create_logical_device(&entry, &instance, &mut data)?;
+
+        create_swapchain(window, &instance, &device, &mut data)?;
+        create_swapchain_image_views(&device, &mut data)?;
+
         return Ok(Self {
             entry,
             instance,
@@ -105,12 +109,17 @@ impl App {
 
     /// Destroy our Vulkan app.
     unsafe fn destroy(&mut self) {
+        self.data
+            .swapchain_image_views
+            .iter()
+            .for_each(|v| self.device.destroy_image_view(*v, None));
+        self.device.destroy_swapchain_khr(self.data.swapchain, None);
+        self.device.destroy_device(None);
+
         if VALIDATION_ENABLED {
             self.instance
                 .destroy_debug_utils_messenger_ext(self.data.messenger, None);
         }
-        self.device.destroy_swapchain_khr(self.data.swapchain, None);
-        self.device.destroy_device(None);
         self.instance.destroy_surface_khr(self.data.surface, None);
         self.instance.destroy_instance(None);
     }
@@ -367,7 +376,9 @@ unsafe fn create_swapchain(
     // https://kylemayes.github.io/vulkanalia/presentation/swapchain.html
     let mut image_count = support.capabilities.min_image_count + 1;
     const NO_MAX: u32 = 0;
-    if support.capabilities.max_image_count != NO_MAX && image_count > support.capabilities.max_image_count {
+    if support.capabilities.max_image_count != NO_MAX
+        && image_count > support.capabilities.max_image_count
+    {
         image_count = support.capabilities.max_image_count;
     }
 
@@ -384,8 +395,7 @@ unsafe fn create_swapchain(
         .surface(data.surface)
         .min_image_count(image_count)
         .image_format(surface_format.format)
-        .image_color_space(surface_format.color_space
-        )
+        .image_color_space(surface_format.color_space)
         .image_extent(extent)
         .image_array_layers(1)
         .image_usage(vk::ImageUsageFlags::COLOR_ATTACHMENT)
@@ -405,6 +415,36 @@ unsafe fn create_swapchain(
     return Ok(());
 }
 
+unsafe fn create_swapchain_image_views(device: &Device, data: &mut AppData) -> Result<()> {
+    let componenets = vk::ComponentMapping::builder()
+        .r(vk::ComponentSwizzle::IDENTITY)
+        .g(vk::ComponentSwizzle::IDENTITY)
+        .b(vk::ComponentSwizzle::IDENTITY)
+        .a(vk::ComponentSwizzle::IDENTITY);
+
+    let subresource_range = vk::ImageSubresourceRange::builder()
+        .aspect_mask(vk::ImageAspectFlags::COLOR)
+        .base_mip_level(0)
+        .level_count(1)
+        .base_array_layer(0)
+        .layer_count(1);
+    data.swapchain_image_views = data
+        .swapchain_images
+        .iter()
+        .map(|i| {
+            let info = vk::ImageViewCreateInfo::builder()
+                .image(*i)
+                .view_type(vk::ImageViewType::_2D)
+                .format(data.swapchain_format)
+                .components(componenets)
+                .subresource_range(subresource_range);
+            return device.create_image_view(&info, None);
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    return Ok(());
+}
+
 /// The Vulkan handles and associated properties used by our Vulkan app.
 #[derive(Debug, Clone, Default)]
 struct AppData {
@@ -417,6 +457,7 @@ struct AppData {
     swapchain_extent: vk::Extent2D,
     swapchain: vk::SwapchainKHR,
     swapchain_images: Vec<vk::Image>,
+    swapchain_image_views: Vec<vk::ImageView>,
 }
 
 unsafe fn create_instance(window: &Window, entry: &Entry, data: &mut AppData) -> Result<Instance> {
