@@ -35,6 +35,8 @@ const VALIDATION_LAYER: vk::ExtensionName =
 
 const DEVICE_EXTENSIONS: &[vk::ExtensionName] = &[vk::KHR_SWAPCHAIN_EXTENSION.name];
 
+const MAX_FRAMES_IN_FLIGHT: usize = 3;
+
 fn main() -> Result<()> {
     pretty_env_logger::init();
 
@@ -59,6 +61,7 @@ fn main() -> Result<()> {
             }
             WindowEvent::CloseRequested => {
                 event_loop_window_target.exit();
+                unsafe { app.device.device_wait_idle().unwrap() }
                 unsafe { app.destroy() };
             }
             _ => {}
@@ -76,6 +79,7 @@ struct App {
     instance: Instance,
     data: AppData,
     device: Device,
+    frame: usize,
 }
 
 impl App {
@@ -99,22 +103,100 @@ impl App {
         create_framebuffers(&device, &mut data)?;
         create_command_pool(&instance, &device, &mut data)?;
         create_command_buffers(&device, &mut data)?;
+        create_sync_objects(&device, &mut data)?;
 
         return Ok(Self {
             entry,
             instance,
             data,
             device,
+            frame: 0,
         });
     }
 
     /// Renders a frame for our Vulkan app.
     unsafe fn render(&mut self, window: &Window) -> Result<()> {
+        const WAIT_FOR_ALL_FENCES: bool = true;
+        const TIMEOUT_NONE: u64 = u64::MAX;
+
+        let in_flight_fence = self.data.in_flight_fences[self.frame];
+        self.device.wait_for_fences(
+            &[in_flight_fence],
+            WAIT_FOR_ALL_FENCES,
+            TIMEOUT_NONE,
+        )?;
+
+        let image_index = self
+            .device
+            .acquire_next_image_khr(
+                self.data.swapchain,
+                TIMEOUT_NONE,
+                self.data.image_available_semaphores[self.frame],
+                vk::Fence::null(),
+            )?
+            .0 as usize;
+
+        let image_in_flight = self.data.images_in_flight[image_index];
+        if !image_in_flight.is_null() {
+            self.device.wait_for_fences(
+                &[image_in_flight],
+                WAIT_FOR_ALL_FENCES,
+                TIMEOUT_NONE,
+            )?;
+        }
+
+        self.data.images_in_flight[image_index] = in_flight_fence;
+
+        let wait_semaphores = &[self.data.image_available_semaphores[self.frame]];
+        let wait_stages = &[vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
+        let command_buffers = &[self.data.command_buffers[image_index]];
+        let signal_semaphores = &[self.data.render_finished_semaphores[self.frame]];
+        let submit_info = vk::SubmitInfo::builder()
+            .wait_semaphores(wait_semaphores)
+            .wait_dst_stage_mask(wait_stages)
+            .command_buffers(command_buffers)
+            .signal_semaphores(signal_semaphores);
+
+
+        self.device
+            .reset_fences(&[self.data.in_flight_fences[self.frame]])?;
+
+
+        self.device.queue_submit(
+            self.data.graphics_queue,
+            &[submit_info],
+            in_flight_fence,
+        )?;
+
+        let swapchains = &[self.data.swapchain];
+        let image_indices = &[image_index as u32];
+        let present_info = vk::PresentInfoKHR::builder()
+            .wait_semaphores(signal_semaphores)
+            .swapchains(swapchains)
+            .image_indices(image_indices);
+
+        self.device
+            .queue_present_khr(self.data.present_queue, &present_info)?;
+
+        self.frame = (self.frame + 1) % MAX_FRAMES_IN_FLIGHT;
+
         return Ok(());
     }
 
     /// Destroy our Vulkan app.
     unsafe fn destroy(&mut self) {
+        self.data
+            .in_flight_fences
+            .iter()
+            .for_each(|f| self.device.destroy_fence(*f, None));
+        self.data
+            .render_finished_semaphores
+            .iter()
+            .for_each(|s| self.device.destroy_semaphore(*s, None));
+        self.data
+            .image_available_semaphores
+            .iter()
+            .for_each(|s| self.device.destroy_semaphore(*s, None));
         self.device
             .destroy_command_pool(self.data.command_pool, None);
         self.data
@@ -397,6 +479,8 @@ unsafe fn create_swapchain(
         image_count = support.capabilities.max_image_count;
     }
 
+    assert_eq!(MAX_FRAMES_IN_FLIGHT, image_count as usize);
+
     let mut queue_family_indices = Vec::new();
     let image_sharing_mode = if indices.graphics != indices.present {
         queue_family_indices.push(indices.graphics);
@@ -484,12 +568,25 @@ unsafe fn create_render_pass(
         .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
         .color_attachments(color_attachments);
 
+    let dependency = vk::SubpassDependency::builder()
+        .src_subpass(vk::SUBPASS_EXTERNAL)
+        .dst_subpass(0)
+        .src_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
+        .src_access_mask(vk::AccessFlags::empty())
+        .dst_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
+        .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE);
+
     let attachments = &[color_attachment];
     let subpasses = &[subpass];
+    let dependencies = &[dependency];
     let info = vk::RenderPassCreateInfo::builder()
         .attachments(attachments)
-        .subpasses(subpasses);
+        .subpasses(subpasses)
+        .dependencies(dependencies);
+
     data.render_pass = device.create_render_pass(&info, None)?;
+
+    return Ok(());
 }
 
 unsafe fn create_pipeline(device: &Device, data: &mut AppData) -> Result<()> {
@@ -599,7 +696,7 @@ unsafe fn create_pipeline(device: &Device, data: &mut AppData) -> Result<()> {
     device.destroy_shader_module(vert_shader_module, None);
     device.destroy_shader_module(frag_shader_module, None);
 
-    todo!()
+    return Ok(());
 }
 
 unsafe fn create_shader_module(device: &Device, bytecode: &[u8]) -> Result<vk::ShaderModule> {
@@ -685,7 +782,10 @@ unsafe fn create_command_buffers(device: &Device, data: &mut AppData) -> Result<
         device.cmd_begin_render_pass(*command_buffer, &info, vk::SubpassContents::INLINE);
 
         device.cmd_bind_pipeline(
-            *command_buffer, vk::PipelineBindPoint::GRAPHICS, data.pipeline);
+            *command_buffer,
+            vk::PipelineBindPoint::GRAPHICS,
+            data.pipeline,
+        );
 
         device.cmd_draw(*command_buffer, 3, 1, 0, 0);
 
@@ -693,6 +793,28 @@ unsafe fn create_command_buffers(device: &Device, data: &mut AppData) -> Result<
 
         device.end_command_buffer(*command_buffer)?;
     }
+
+    return Ok(());
+}
+unsafe fn create_sync_objects(device: &Device, data: &mut AppData) -> Result<()> {
+    let semaphore_info = vk::SemaphoreCreateInfo::builder();
+    let fence_info = vk::FenceCreateInfo::builder().flags(vk::FenceCreateFlags::SIGNALED);
+
+    for _ in 0..MAX_FRAMES_IN_FLIGHT {
+        data.image_available_semaphores
+            .push(device.create_semaphore(&semaphore_info, None)?);
+        data.render_finished_semaphores
+            .push(device.create_semaphore(&semaphore_info, None)?);
+
+        data.in_flight_fences
+            .push(device.create_fence(&fence_info, None)?)
+    }
+
+    data.images_in_flight = data
+        .swapchain_images
+        .iter()
+        .map(|_| vk::Fence::null())
+        .collect();
 
     return Ok(());
 }
@@ -716,6 +838,10 @@ struct AppData {
     framebuffers: Vec<vk::Framebuffer>,
     command_pool: vk::CommandPool,
     command_buffers: Vec<vk::CommandBuffer>,
+    image_available_semaphores: Vec<vk::Semaphore>,
+    render_finished_semaphores: Vec<vk::Semaphore>,
+    in_flight_fences: Vec<vk::Fence>,
+    images_in_flight: Vec<vk::Fence>,
 }
 
 unsafe fn create_instance(window: &Window, entry: &Entry, data: &mut AppData) -> Result<Instance> {
