@@ -13,6 +13,7 @@ use std::collections::HashSet;
 use std::ffi::CStr;
 use std::mem::size_of;
 use std::os::raw::c_void;
+use std::ptr::copy_nonoverlapping as memcpy;
 use thiserror::Error;
 use vulkanalia::Version;
 use vulkanalia::bytecode::Bytecode;
@@ -26,7 +27,6 @@ use winit::dpi::LogicalSize;
 use winit::event::{Event, WindowEvent};
 use winit::event_loop::EventLoop;
 use winit::window::{Window, WindowBuilder};
-use std::ptr::copy_nonoverlapping as memcpy;
 
 const PORTABILITY_MACOS_VERSION: Version = Version::new(1, 3, 216);
 
@@ -460,6 +460,8 @@ impl QueueFamilyIndices {
     ) -> Result<Self> {
         let properties = instance.get_physical_device_queue_family_properties(physical_device);
 
+        // NOTE: GRAPHICS queues implicitly support TRANSFER capabilities, i.e. transferring memory
+        //       from RAM to VRAM
         let graphics = properties
             .iter()
             .position(|p| p.queue_flags.contains(vk::QueueFlags::GRAPHICS))
@@ -860,42 +862,60 @@ unsafe fn get_memory_type_index(
         .ok_or_else(|| anyhow!("Failed to find suitable memory type."))
 }
 
-unsafe fn create_vertex_buffer(
+unsafe fn create_buffer(
     instance: &Instance,
     device: &Device,
     data: &mut AppData,
-) -> Result<()> {
+    size: vk::DeviceSize,
+    usage: vk::BufferUsageFlags,
+    properties: vk::MemoryPropertyFlags,
+) -> Result<(vk::Buffer, vk::DeviceMemory)> {
     let buffer_info = vk::BufferCreateInfo::builder()
-        .size((size_of::<Vertex>() * VERTICES.len()) as u64)
-        .usage(vk::BufferUsageFlags::VERTEX_BUFFER)
+        .size(size)
+        .usage(usage)
         .sharing_mode(vk::SharingMode::EXCLUSIVE);
 
-    data.vertex_buffer = device.create_buffer(&buffer_info, None)?;
-
-    let requirements = device.get_buffer_memory_requirements(data.vertex_buffer);
+    let buffer = device.create_buffer(&buffer_info, None)?;
+    let requirements = device.get_buffer_memory_requirements(buffer);
 
     let memory_info = vk::MemoryAllocateInfo::builder()
         .allocation_size(requirements.size)
         .memory_type_index(get_memory_type_index(
             instance,
             data,
-            vk::MemoryPropertyFlags::HOST_COHERENT | vk::MemoryPropertyFlags::HOST_VISIBLE,
+            properties,
             requirements,
         )?);
 
-    data.vertex_buffer_memory = device.allocate_memory(&memory_info, None)?;
-    device.bind_buffer_memory(data.vertex_buffer, data.vertex_buffer_memory, 0)?;
+    let buffer_memory = device.allocate_memory(&memory_info, None)?;
+    device.bind_buffer_memory(buffer, buffer_memory, 0)?;
 
-    let memory = device.map_memory(
-        data.vertex_buffer_memory,
-        0,
-        buffer_info.size,
-        vk::MemoryMapFlags::empty(),
+    return Ok((buffer, buffer_memory));
+}
+unsafe fn create_vertex_buffer(
+    instance: &Instance,
+    device: &Device,
+    data: &mut AppData,
+) -> Result<()> {
+    let size = (size_of::<Vertex>() * VERTICES.len()) as u64;
+
+    let (vertex_buffer, vertex_buffer_memory) = create_buffer(
+        instance,
+        device,
+        data,
+        size,
+        vk::BufferUsageFlags::VERTEX_BUFFER,
+        vk::MemoryPropertyFlags::HOST_COHERENT | vk::MemoryPropertyFlags::HOST_VISIBLE,
     )?;
 
-    memcpy(VERTICES.as_ptr(), memory.cast(), VERTICES.len());
-    device.unmap_memory(data.vertex_buffer_memory);
+    data.vertex_buffer = vertex_buffer;
+    data.vertex_buffer_memory = vertex_buffer_memory;
 
+    let memory = device.map_memory(vertex_buffer_memory, 0, size, vk::MemoryMapFlags::empty())?;
+
+    memcpy(VERTICES.as_ptr(), memory.cast(), VERTICES.len());
+
+    device.unmap_memory(vertex_buffer_memory);
 
     return Ok(());
 }
