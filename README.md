@@ -8,4 +8,4 @@ https://kylemayes.github.io/vulkanalia
 
 current chapter
 
-https://kylemayes.github.io/vulkanalia/texture/images.html
+https://kylemayes.github.io/vulkanalia/texture/image_view_and_sampler.html
