@@ -10,7 +10,7 @@
 use std::collections::HashSet;
 use std::ffi::CStr;
 use std::fs::File;
-use std::mem::size_of;
+use std::mem::{offset_of, size_of};
 use std::os::raw::c_void;
 use std::ptr::copy_nonoverlapping as memcpy;
 use std::time::Instant;
@@ -49,12 +49,11 @@ type Vec3 = cgmath::Vector3<f32>;
 type Mat4 = cgmath::Matrix4<f32>;
 
 static VERTICES: [Vertex; 4] = [
-    Vertex::new(vec2(-0.5, -0.5), vec3(1.0, 0.0, 0.0)),
-    Vertex::new(vec2(0.5, -0.5), vec3(0.0, 1.0, 0.0)),
-    Vertex::new(vec2(0.5, 0.5), vec3(0.0, 0.0, 1.0)),
-    Vertex::new(vec2(-0.5, 0.5), vec3(1.0, 1.0, 1.0)),
+    Vertex::new(vec2(-0.5, -0.5), vec3(1., 0., 0.), vec2(1., 0.)),
+    Vertex::new(vec2(0.5, -0.5), vec3(0., 1., 0.), vec2(0., 0.)),
+    Vertex::new(vec2(0.5, 0.5), vec3(0., 0., 1.), vec2(0., 1.)),
+    Vertex::new(vec2(-0.5, 0.5), vec3(1., 1., 1.), vec2(1., 1.)),
 ];
-
 const INDICES: &[u16] = &[0, 1, 2, 2, 3, 0];
 
 fn main() -> Result<()> {
@@ -463,7 +462,7 @@ extern "system" fn debug_callback(
     } else if severity >= vk::DebugUtilsMessageSeverityFlagsEXT::INFO {
         debug!("({:?}) {:?}", type_, message);
     } else {
-        trace!("({:?}) {:?}", severity, message);
+        trace!("({:?}) {:?}", type_, message);
     }
 
     return vk::FALSE;
@@ -494,7 +493,7 @@ unsafe fn pick_physical_device(instance: &Instance, data: &mut AppData) -> Resul
 
 unsafe fn check_physical_device(
     instance: &Instance,
-    data: &mut AppData,
+    data: &AppData,
     physical_device: vk::PhysicalDevice,
 ) -> Result<()> {
     let _ = QueueFamilyIndices::get(instance, data, physical_device)?;
@@ -741,7 +740,13 @@ unsafe fn create_descriptor_set_layout(device: &Device, data: &mut AppData) -> R
         .descriptor_count(1)
         .stage_flags(vk::ShaderStageFlags::VERTEX);
 
-    let bindings = &[ubo_binding];
+    let sampler_binding = vk::DescriptorSetLayoutBinding::builder()
+        .binding(1)
+        .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+        .descriptor_count(1)
+        .stage_flags(vk::ShaderStageFlags::FRAGMENT);
+
+    let bindings = &[ubo_binding, sampler_binding];
     let info = vk::DescriptorSetLayoutCreateInfo::builder().bindings(bindings);
 
     data.descriptor_set_layout = device.create_descriptor_set_layout(&info, None)?;
@@ -876,11 +881,9 @@ unsafe fn create_framebuffers(device: &Device, data: &mut AppData) -> Result<()>
                 .width(data.swapchain_extent.width)
                 .height(data.swapchain_extent.height)
                 .layers(1);
-            device
-                .create_framebuffer(&create_info, None)
-                .map_err(|e| anyhow!(e))
+            device.create_framebuffer(&create_info, None)
         })
-        .collect::<Result<Vec<_>>>()?;
+        .collect::<Result<Vec<_>, _>>()?;
 
     return Ok(());
 }
@@ -1121,7 +1124,11 @@ unsafe fn create_descriptor_pool(device: &Device, data: &mut AppData) -> Result<
         .type_(vk::DescriptorType::UNIFORM_BUFFER)
         .descriptor_count(data.swapchain_images.len() as u32);
 
-    let pool_sizes = &[ubo_size];
+    let sampler_size = vk::DescriptorPoolSize::builder()
+        .type_(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+        .descriptor_count(data.swapchain_images.len() as u32);
+
+    let pool_sizes = &[ubo_size, sampler_size];
     let info = vk::DescriptorPoolCreateInfo::builder()
         .pool_sizes(pool_sizes)
         .max_sets(data.swapchain_images.len() as u32);
@@ -1153,7 +1160,20 @@ unsafe fn create_descriptor_sets(device: &Device, data: &mut AppData) -> Result<
             .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
             .buffer_info(buffer_info);
 
-        device.update_descriptor_sets(&[ubo_write], &[] as &[vk::CopyDescriptorSet]);
+        let info = vk::DescriptorImageInfo::builder()
+            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+            .image_view(data.texture_image_view)
+            .sampler(data.texture_sampler);
+
+        let image_info = &[info];
+        let sampler_write = vk::WriteDescriptorSet::builder()
+            .dst_set(data.descriptor_sets[i])
+            .dst_binding(1)
+            .dst_array_element(0)
+            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+            .image_info(image_info);
+
+        device.update_descriptor_sets(&[ubo_write, sampler_write], &[] as &[vk::CopyDescriptorSet]);
     }
 
     return Ok(());
@@ -1250,7 +1270,7 @@ struct QueueFamilyIndices {
 impl QueueFamilyIndices {
     unsafe fn get(
         instance: &Instance,
-        data: &mut AppData,
+        data: &AppData,
         physical_device: vk::PhysicalDevice,
     ) -> Result<Self> {
         let properties = instance.get_physical_device_queue_family_properties(physical_device);
@@ -1292,7 +1312,7 @@ struct SwapchainSupport {
 impl SwapchainSupport {
     unsafe fn get(
         instance: &Instance,
-        data: &mut AppData,
+        data: &AppData,
         physical_device: vk::PhysicalDevice,
     ) -> Result<Self> {
         return Ok(Self {
@@ -1319,11 +1339,16 @@ struct UniformBufferObject {
 struct Vertex {
     pos: Vec2,
     color: Vec3,
+    tex_coord: Vec2,
 }
 
 impl Vertex {
-    const fn new(pos: Vec2, color: Vec3) -> Self {
-        Self { pos, color }
+    const fn new(pos: Vec2, color: Vec3, tex_coord: Vec2) -> Self {
+        Self {
+            pos,
+            color,
+            tex_coord,
+        }
     }
 
     fn binding_description() -> vk::VertexInputBindingDescription {
@@ -1334,13 +1359,15 @@ impl Vertex {
             .build()
     }
 
-    fn attribute_descriptions() -> [vk::VertexInputAttributeDescription; 2] {
+    fn attribute_descriptions() -> [vk::VertexInputAttributeDescription; 3] {
         let pos = vk::VertexInputAttributeDescription::builder()
             .binding(0)
             .location(0)
             .format(vk::Format::R32G32_SFLOAT)
             .offset(0)
             .build();
+
+        assert_eq!(offset_of!(Vertex, pos), 0);
 
         let color = vk::VertexInputAttributeDescription::builder()
             .binding(0)
@@ -1349,7 +1376,21 @@ impl Vertex {
             .offset(size_of::<Vec2>() as u32)
             .build();
 
-        [pos, color]
+        assert_eq!(offset_of!(Vertex, color), size_of::<Vec2>());
+
+        let tex_coord = vk::VertexInputAttributeDescription::builder()
+            .binding(0)
+            .location(2)
+            .format(vk::Format::R32G32_SFLOAT)
+            .offset((size_of::<Vec2>() + size_of::<Vec3>()) as u32)
+            .build();
+
+        assert_eq!(
+            offset_of!(Vertex, tex_coord),
+            size_of::<Vec2>() + size_of::<Vec3>()
+        );
+
+        [pos, color, tex_coord]
     }
 }
 
